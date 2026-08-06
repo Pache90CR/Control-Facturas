@@ -17,8 +17,8 @@ except ImportError:
 BASE_DIR = "facturas_almacenadas"
 CACHE_FILE = "token_cache.bin"
 
-# ⚠️ PEGA AQUÍ TU ID DE CLIENTE DE AZURE
-CLIENT_ID = "6f6074bd-8f47-4589-a691-7a05cebae707"
+# ⚠️ CLIENT ID DE AZURE
+CLIENT_ID = "TU_CLIENT_ID_COPIADO_DE_AZURE"
 
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read"]
@@ -34,7 +34,7 @@ PALABRAS_EXCLUIDAS = [
 ]
 
 # ---------------------------------------------------------
-# 1. AUTENTICACIÓN Y MANEJO DE TOKEN
+# 1. MANEJO DE CACHÉ Y AUTENTICACIÓN
 # ---------------------------------------------------------
 def load_cache():
     cache = msal.SerializableTokenCache()
@@ -110,30 +110,27 @@ def parse_xml_invoice(xml_bytes):
         return None
 
 # ---------------------------------------------------------
-# 2. FUNCIÓN CON CACHÉ DE STREAMLIT (SÚPER RÁPIDA)
+# 2. BÚSQUEDA OPTIMIZADA EN UNA SOLA PETICIÓN MASIVA
 # ---------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_invoices_from_api(access_token, start_str, end_str):
+@st.cache_data(ttl=600, show_spinner=False)
+def download_invoices_fast(access_token, start_str, end_str):
     headers = {'Authorization': f'Bearer {access_token}'}
+    
+    # Inclusión de $expand=attachments para traer correos Y archivos adjuntos en 1 sola consulta HTTP
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
         f"?$filter=hasAttachments eq true and receivedDateTime ge {start_str} and receivedDateTime le {end_str}"
         "&$select=id,subject,from,receivedDateTime"
-        "&$top=300"
+        "&$expand=attachments($select=name,contentType,contentBytes)"
+        "&$top=150"
     )
     
     response = requests.get(endpoint, headers=headers)
     if response.status_code != 200:
         return []
-    return response.json().get('value', [])
 
-def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
-    start_str = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
-    end_str = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
-
-    messages = fetch_invoices_from_api(access_token, start_str, end_str)
+    messages = response.json().get('value', [])
     records = []
-    headers = {'Authorization': f'Bearer {access_token}'}
 
     for msg in messages:
         subject = msg.get('subject') or "Sin Asunto"
@@ -142,7 +139,6 @@ def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
         if any(excl in subject_lower for excl in PALABRAS_EXCLUIDAS):
             continue
 
-        msg_id = msg['id']
         sender_info = msg.get('from', {}).get('emailAddress', {}) if msg.get('from') else {}
         sender = f"{sender_info.get('name', '')} <{sender_info.get('address', '')}>"
         
@@ -152,61 +148,54 @@ def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
         year = str(msg_date.year)
         quarter = get_quarter(msg_date.month)
 
-        attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments?$select=id,name,contentType,contentBytes"
-        attach_res = requests.get(attach_endpoint, headers=headers)
-        
-        if attach_res.status_code == 200:
-            attachments = attach_res.json().get('value', [])
-            xml_data = None
-            pdf_path = ""
-            pdf_filename = ""
+        attachments = msg.get('attachments', [])
+        xml_data = None
+        pdf_path = ""
+        pdf_filename = ""
 
-            for att in attachments:
-                name = att.get('name', '')
-                name_lower = name.lower()
+        for att in attachments:
+            name = att.get('name', '')
+            name_lower = name.lower()
 
-                es_pdf = name_lower.endswith('.pdf')
-                es_xml = name_lower.endswith('.xml')
-                es_factura = any(p in subject_lower for p in PALABRAS_CLAVE_PERMITIDAS) or \
-                             any(p in name_lower for p in PALABRAS_CLAVE_PERMITIDAS)
+            es_pdf = name_lower.endswith('.pdf')
+            es_xml = name_lower.endswith('.xml')
+            es_factura = any(p in subject_lower for p in PALABRAS_CLAVE_PERMITIDAS) or \
+                         any(p in name_lower for p in PALABRAS_CLAVE_PERMITIDAS)
 
-                if (es_pdf or es_xml) and es_factura and 'contentBytes' in att:
-                    import base64
-                    file_bytes = base64.b64decode(att['contentBytes'])
-                    target_dir = os.path.join(BASE_DIR, year, quarter)
-                    os.makedirs(target_dir, exist_ok=True)
+            if (es_pdf or es_xml) and es_factura and 'contentBytes' in att:
+                import base64
+                file_bytes = base64.b64decode(att['contentBytes'])
+                target_dir = os.path.join(BASE_DIR, year, quarter)
+                os.makedirs(target_dir, exist_ok=True)
 
-                    safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name}"
-                    file_path = os.path.join(target_dir, safe_filename)
+                safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name}"
+                file_path = os.path.join(target_dir, safe_filename)
 
-                    if not os.path.exists(file_path):
-                        with open(file_path, 'wb') as f:
-                            f.write(file_bytes)
+                if not os.path.exists(file_path):
+                    with open(file_path, 'wb') as f:
+                        f.write(file_bytes)
 
-                    if es_pdf:
-                        pdf_path = file_path
-                        pdf_filename = safe_filename
-                    elif es_xml and not xml_data:
-                        xml_data = parse_xml_invoice(file_bytes)
+                if es_pdf:
+                    pdf_path = file_path
+                    pdf_filename = safe_filename
+                elif es_xml and not xml_data:
+                    xml_data = parse_xml_invoice(file_bytes)
 
-            if pdf_path:
-                records.append({
-                    "Fecha": msg_date.strftime('%Y-%m-%d'),
-                    "Año": year,
-                    "Trimestre": quarter,
-                    "Proveedor": xml_data["Proveedor"] if xml_data else sender,
-                    "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
-                    "IVA": xml_data["IVA"] if xml_data else 0.0,
-                    "Total": xml_data["Total"] if xml_data else 0.0,
-                    "Asunto": subject,
-                    "Archivo": pdf_filename,
-                    "Ruta": pdf_path
-                })
+        if pdf_path:
+            records.append({
+                "Fecha": msg_date.strftime('%Y-%m-%d'),
+                "Año": year,
+                "Trimestre": quarter,
+                "Proveedor": xml_data["Proveedor"] if xml_data else sender,
+                "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
+                "IVA": xml_data["IVA"] if xml_data else 0.0,
+                "Total": xml_data["Total"] if xml_data else 0.0,
+                "Asunto": subject,
+                "Archivo": pdf_filename,
+                "Ruta": pdf_path
+            })
 
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values(by="Fecha", ascending=True)
-    return df
+    return records
 
 def merge_pdfs(file_paths):
     if not HAS_PYPDF:
@@ -224,7 +213,7 @@ def merge_pdfs(file_paths):
     return output_pdf.getvalue()
 
 # ---------------------------------------------------------
-# 3. INTERFAZ STREAMLIT
+# 3. INTERFAZ DE USUARIO (STREAMLIT)
 # ---------------------------------------------------------
 st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
@@ -242,13 +231,19 @@ if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=Tru
     if CLIENT_ID == "TU_CLIENT_ID_COPIADO_DE_AZURE":
         st.sidebar.error("Por favor pega tu Client ID de Azure en la variable CLIENT_ID de app.py.")
     else:
-        with st.spinner("Descargando facturas de forma rápida..."):
+        with st.spinner("Procesando facturas a alta velocidad..."):
             token = get_graph_token()
             if token:
-                df_invoices = download_invoices_graph(token, fecha_inicio, fecha_fin)
+                start_str = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
+                end_str = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
+                
+                records = download_invoices_fast(token, start_str, end_str)
+                df_invoices = pd.DataFrame(records)
+                
                 if not df_invoices.empty:
+                    df_invoices = df_invoices.sort_values(by="Fecha", ascending=True)
                     st.session_state['df_invoices_graph'] = df_invoices
-                    st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
+                    st.success(f"¡Sincronización instantánea! Se procesaron {len(df_invoices)} facturas.")
                 else:
                     st.info("No se encontraron facturas en el rango de fechas seleccionado.")
 
