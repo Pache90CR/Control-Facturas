@@ -8,7 +8,6 @@ import streamlit as st
 import requests
 import msal
 
-# Manejo seguro para la unión de PDFs
 try:
     from pypdf import PdfWriter
     HAS_PYPDF = True
@@ -35,7 +34,7 @@ PALABRAS_EXCLUIDAS = [
 ]
 
 # ---------------------------------------------------------
-# 1. MANEJO DE AUTENTICACIÓN
+# 1. AUTENTICACIÓN Y MANEJO DE TOKEN
 # ---------------------------------------------------------
 def load_cache():
     cache = msal.SerializableTokenCache()
@@ -84,15 +83,9 @@ def get_quarter(month):
     else:
         return "Q4 (Oct-Dic)"
 
-# ---------------------------------------------------------
-# 2. PROCESAMIENTO DE ARCHIVOS XML Y PDF
-# ---------------------------------------------------------
 def parse_xml_invoice(xml_bytes):
-    """Extrae montos, emisor y clave fiscal desde el XML de factura electrónica."""
     try:
         root = ET.fromstring(xml_bytes)
-        ns = {k if k else 'default': v for event, (k, v) in ET.iterparse(io.BytesIO(xml_bytes), events=['start-ns'])}
-        
         def find_text(tag_name):
             for elem in root.iter():
                 if elem.tag.endswith(tag_name):
@@ -104,7 +97,6 @@ def parse_xml_invoice(xml_bytes):
         iva = float(find_text("TotalImpuesto") or 0)
         total = float(find_text("TotalComprobante") or 0)
 
-        # Recalcular subtotal si no viene explícito
         if subtotal == total and iva > 0:
             subtotal = total - iva
 
@@ -117,25 +109,31 @@ def parse_xml_invoice(xml_bytes):
     except Exception:
         return None
 
-def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
+# ---------------------------------------------------------
+# 2. FUNCIÓN CON CACHÉ DE STREAMLIT (SÚPER RÁPIDA)
+# ---------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_invoices_from_api(access_token, start_str, end_str):
     headers = {'Authorization': f'Bearer {access_token}'}
-    start_str = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
-    end_str = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
-
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
         f"?$filter=hasAttachments eq true and receivedDateTime ge {start_str} and receivedDateTime le {end_str}"
         "&$select=id,subject,from,receivedDateTime"
-        "&$top=500"
+        "&$top=300"
     )
     
     response = requests.get(endpoint, headers=headers)
     if response.status_code != 200:
-        st.error(f"Error consultando Microsoft Graph: {response.json()}")
-        return pd.DataFrame()
+        return []
+    return response.json().get('value', [])
 
-    messages = response.json().get('value', [])
+def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
+    start_str = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
+    end_str = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
+
+    messages = fetch_invoices_from_api(access_token, start_str, end_str)
     records = []
+    headers = {'Authorization': f'Bearer {access_token}'}
 
     for msg in messages:
         subject = msg.get('subject') or "Sin Asunto"
@@ -154,12 +152,11 @@ def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
         year = str(msg_date.year)
         quarter = get_quarter(msg_date.month)
 
-        attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments"
+        attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments?$select=id,name,contentType,contentBytes"
         attach_res = requests.get(attach_endpoint, headers=headers)
         
         if attach_res.status_code == 200:
             attachments = attach_res.json().get('value', [])
-            
             xml_data = None
             pdf_path = ""
             pdf_filename = ""
@@ -182,8 +179,9 @@ def download_invoices_graph(access_token, fecha_inicio, fecha_fin):
                     safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name}"
                     file_path = os.path.join(target_dir, safe_filename)
 
-                    with open(file_path, 'wb') as f:
-                        f.write(file_bytes)
+                    if not os.path.exists(file_path):
+                        with open(file_path, 'wb') as f:
+                            f.write(file_bytes)
 
                     if es_pdf:
                         pdf_path = file_path
@@ -244,13 +242,13 @@ if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=Tru
     if CLIENT_ID == "TU_CLIENT_ID_COPIADO_DE_AZURE":
         st.sidebar.error("Por favor pega tu Client ID de Azure en la variable CLIENT_ID de app.py.")
     else:
-        with st.spinner("Procesando facturas y leyendo datos XML/PDF..."):
+        with st.spinner("Descargando facturas de forma rápida..."):
             token = get_graph_token()
             if token:
                 df_invoices = download_invoices_graph(token, fecha_inicio, fecha_fin)
                 if not df_invoices.empty:
                     st.session_state['df_invoices_graph'] = df_invoices
-                    st.success(f"¡Sincronización exitosa! Se procesaron {len(df_invoices)} facturas.")
+                    st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
                 else:
                     st.info("No se encontraron facturas en el rango de fechas seleccionado.")
 
@@ -283,7 +281,6 @@ if not df.empty:
     st.subheader("⚡ Opciones de Descarga y Consolidación")
     col1, col2, col3 = st.columns(3)
 
-    # 🖨️ OPCIÓN 1: PDF Unificado para Impresión Directa
     with col1:
         st.markdown("### 🖨️ PDF Unificado (Impresión)")
         st.caption("Junta todos los PDFs del periodo en un solo documento listo para imprimir.")
@@ -301,23 +298,18 @@ if not df.empty:
         else:
             st.warning("Instala `pypdf` (`pip install pypdf`) para activar la unificación de PDFs.")
 
-    # 📈 NUEVA OPCIÓN: Consolidación de Datos en un Reporte Resumen (Excel con XML)
     with col2:
         st.markdown("### 📈 Reporte Resumen XML")
         st.caption("Excel consolidado con Subtotal, IVA, Total acumulado y desglose por proveedor.")
         
         output_excel = io.BytesIO()
         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-            # Pestaña 1: Detalle general ordenado por fecha
             df[['Fecha', 'Trimestre', 'Proveedor', 'Subtotal', 'IVA', 'Total', 'Asunto', 'Archivo']].to_excel(
                 writer, index=False, sheet_name='Detalle_Por_Fecha'
             )
-            
-            # Pestaña 2: Desglose automático por proveedor
             df_prov = df.groupby('Proveedor')[['Subtotal', 'IVA', 'Total']].sum().reset_index()
             df_prov.to_excel(writer, index=False, sheet_name='Desglose_Por_Proveedor')
 
-            # Pestaña 3: Acumulado general del trimestre
             df_resumen = pd.DataFrame([{
                 "Rango Fechas": f"{fecha_inicio} al {fecha_fin}",
                 "Cant. Facturas": len(df),
@@ -335,7 +327,6 @@ if not df.empty:
             use_container_width=True
         )
 
-    # 📦 OPCIÓN 3: Paquete ZIP
     with col3:
         st.markdown("### 📦 Paquete Completo (.ZIP)")
         st.caption("Mantiene los archivos individuales descargados en disco.")
