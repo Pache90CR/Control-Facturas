@@ -14,74 +14,47 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-BASE_DIR = "facturas_almacenadas"
-CACHE_FILE = "token_cache.bin"
-
-# ⚠️ CLIENT ID DE AZURE
-CLIENT_ID = "TU_CLIENT_ID_COPIADO_DE_AZURE"
-
+CLIENT_ID = "6f6074bd-8f47-4589-a691-7a05cebae707"
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read"]
+
+PALABRAS_EXCLUIDAS = [
+    "estado de cuenta", "resumen de cuenta", 
+    "extracto", "boletin", "publicidad", "oferta"
+]
 
 PALABRAS_CLAVE_PERMITIDAS = [
     "factura", "comprobante", "electronico", "electronica", 
     "tiquete", "nota de credito", "documento electronico", "fe-"
 ]
 
-PALABRAS_EXCLUIDAS = [
-    "estado de cuenta", "estado de cuenta comercio", "resumen de cuenta", 
-    "extracto", "boletin", "publicidad", "oferta", "notificacion de pago"
-]
-
 # ---------------------------------------------------------
-# 1. MANEJO DE CACHÉ Y AUTENTICACIÓN
+# 1. AUTENTICACIÓN
 # ---------------------------------------------------------
-def load_cache():
-    cache = msal.SerializableTokenCache()
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            cache.deserialize(f.read())
-    return cache
-
-def save_cache(cache):
-    if cache.has_state_changed:
-        with open(CACHE_FILE, "w") as f:
-            f.write(cache.serialize())
-
 def get_graph_token():
-    cache = load_cache()
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
     accounts = app.get_accounts()
     result = None
-    
     if accounts:
         result = app.acquire_token_silent(SCOPES, account=accounts[0])
-        
     if not result:
         try:
             result = app.acquire_token_interactive(scopes=SCOPES)
-            save_cache(cache)
         except Exception as e:
             st.error(f"Error de autenticación: {e}")
             return None
-    else:
-        save_cache(cache)
 
     if result and "access_token" in result:
         return result["access_token"]
     else:
-        st.error(f"Error al obtener token: {result.get('error_description')}")
+        st.error("No se pudo obtener el token de acceso.")
         return None
 
 def get_quarter(month):
-    if month in [1, 2, 3]:
-        return "Q1 (Ene-Mar)"
-    elif month in [4, 5, 6]:
-        return "Q2 (Abr-Jun)"
-    elif month in [7, 8, 9]:
-        return "Q3 (Jul-Sep)"
-    else:
-        return "Q4 (Oct-Dic)"
+    if month in [1, 2, 3]: return "Q1 (Ene-Mar)"
+    elif month in [4, 5, 6]: return "Q2 (Abr-Jun)"
+    elif month in [7, 8, 9]: return "Q3 (Jul-Sep)"
+    else: return "Q4 (Oct-Dic)"
 
 def parse_xml_invoice(xml_bytes):
     try:
@@ -100,37 +73,33 @@ def parse_xml_invoice(xml_bytes):
         if subtotal == total and iva > 0:
             subtotal = total - iva
 
-        return {
-            "Proveedor": emisor,
-            "Subtotal": subtotal,
-            "IVA": iva,
-            "Total": total
-        }
+        return {"Proveedor": emisor, "Subtotal": subtotal, "IVA": iva, "Total": total}
     except Exception:
         return None
 
 # ---------------------------------------------------------
-# 2. BÚSQUEDA OPTIMIZADA EN UNA SOLA PETICIÓN MASIVA
+# 2. PROCESAMIENTO EN MEMORIA RAM (SÚPER RÁPIDO)
 # ---------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def download_invoices_fast(access_token, start_str, end_str):
+def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
-    
-    # Inclusión de $expand=attachments para traer correos Y archivos adjuntos en 1 sola consulta HTTP
+    start_iso = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
+    end_iso = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
+
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
-        f"?$filter=hasAttachments eq true and receivedDateTime ge {start_str} and receivedDateTime le {end_str}"
+        f"?$filter=hasAttachments eq true and receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
         "&$select=id,subject,from,receivedDateTime"
-        "&$expand=attachments($select=name,contentType,contentBytes)"
-        "&$top=150"
+        "&$top=100"
     )
     
     response = requests.get(endpoint, headers=headers)
     if response.status_code != 200:
-        return []
+        st.error(f"Error consultando Microsoft Graph: {response.status_code}")
+        return [], {}
 
     messages = response.json().get('value', [])
     records = []
+    files_in_memory = {}  # Guarda los bytes en memoria en lugar de disco
 
     for msg in messages:
         subject = msg.get('subject') or "Sin Asunto"
@@ -139,6 +108,7 @@ def download_invoices_fast(access_token, start_str, end_str):
         if any(excl in subject_lower for excl in PALABRAS_EXCLUIDAS):
             continue
 
+        msg_id = msg['id']
         sender_info = msg.get('from', {}).get('emailAddress', {}) if msg.get('from') else {}
         sender = f"{sender_info.get('name', '')} <{sender_info.get('address', '')}>"
         
@@ -148,63 +118,58 @@ def download_invoices_fast(access_token, start_str, end_str):
         year = str(msg_date.year)
         quarter = get_quarter(msg_date.month)
 
-        attachments = msg.get('attachments', [])
-        xml_data = None
-        pdf_path = ""
-        pdf_filename = ""
+        attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments?$select=id,name,contentBytes"
+        attach_res = requests.get(attach_endpoint, headers=headers)
+        
+        if attach_res.status_code == 200:
+            attachments = attach_res.json().get('value', [])
+            xml_data = None
+            pdf_filename = ""
+            pdf_bytes = None
 
-        for att in attachments:
-            name = att.get('name', '')
-            name_lower = name.lower()
+            for att in attachments:
+                name = att.get('name', '')
+                name_lower = name.lower()
 
-            es_pdf = name_lower.endswith('.pdf')
-            es_xml = name_lower.endswith('.xml')
-            es_factura = any(p in subject_lower for p in PALABRAS_CLAVE_PERMITIDAS) or \
-                         any(p in name_lower for p in PALABRAS_CLAVE_PERMITIDAS)
+                es_pdf = name_lower.endswith('.pdf')
+                es_xml = name_lower.endswith('.xml')
+                es_factura = any(p in subject_lower for p in PALABRAS_CLAVE_PERMITIDAS) or \
+                             any(p in name_lower for p in PALABRAS_CLAVE_PERMITIDAS)
 
-            if (es_pdf or es_xml) and es_factura and 'contentBytes' in att:
-                import base64
-                file_bytes = base64.b64decode(att['contentBytes'])
-                target_dir = os.path.join(BASE_DIR, year, quarter)
-                os.makedirs(target_dir, exist_ok=True)
+                if (es_pdf or es_xml) and es_factura and 'contentBytes' in att:
+                    import base64
+                    file_bytes = base64.b64decode(att['contentBytes'])
+                    safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name}"
 
-                safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name}"
-                file_path = os.path.join(target_dir, safe_filename)
+                    if es_pdf:
+                        pdf_filename = safe_filename
+                        pdf_bytes = file_bytes
+                        files_in_memory[safe_filename] = file_bytes
+                    elif es_xml and not xml_data:
+                        xml_data = parse_xml_invoice(file_bytes)
 
-                if not os.path.exists(file_path):
-                    with open(file_path, 'wb') as f:
-                        f.write(file_bytes)
+            if pdf_filename:
+                records.append({
+                    "Fecha": msg_date.strftime('%Y-%m-%d'),
+                    "Año": year,
+                    "Trimestre": quarter,
+                    "Proveedor": xml_data["Proveedor"] if xml_data else sender,
+                    "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
+                    "IVA": xml_data["IVA"] if xml_data else 0.0,
+                    "Total": xml_data["Total"] if xml_data else 0.0,
+                    "Asunto": subject,
+                    "Archivo": pdf_filename
+                })
 
-                if es_pdf:
-                    pdf_path = file_path
-                    pdf_filename = safe_filename
-                elif es_xml and not xml_data:
-                    xml_data = parse_xml_invoice(file_bytes)
+    return records, files_in_memory
 
-        if pdf_path:
-            records.append({
-                "Fecha": msg_date.strftime('%Y-%m-%d'),
-                "Año": year,
-                "Trimestre": quarter,
-                "Proveedor": xml_data["Proveedor"] if xml_data else sender,
-                "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
-                "IVA": xml_data["IVA"] if xml_data else 0.0,
-                "Total": xml_data["Total"] if xml_data else 0.0,
-                "Asunto": subject,
-                "Archivo": pdf_filename,
-                "Ruta": pdf_path
-            })
-
-    return records
-
-def merge_pdfs(file_paths):
-    if not HAS_PYPDF:
-        return None
+def merge_pdfs_from_memory(files_dict, filenames):
+    if not HAS_PYPDF: return None
     merger = PdfWriter()
-    for path in file_paths:
-        if os.path.exists(path):
+    for name in filenames:
+        if name in files_dict:
             try:
-                merger.append(path)
+                merger.append(io.BytesIO(files_dict[name]))
             except Exception:
                 pass
     output_pdf = io.BytesIO()
@@ -213,7 +178,7 @@ def merge_pdfs(file_paths):
     return output_pdf.getvalue()
 
 # ---------------------------------------------------------
-# 3. INTERFAZ DE USUARIO (STREAMLIT)
+# 3. INTERFAZ STREAMLIT
 # ---------------------------------------------------------
 st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
@@ -231,26 +196,26 @@ if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=Tru
     if CLIENT_ID == "TU_CLIENT_ID_COPIADO_DE_AZURE":
         st.sidebar.error("Por favor pega tu Client ID de Azure en la variable CLIENT_ID de app.py.")
     else:
-        with st.spinner("Procesando facturas a alta velocidad..."):
+        with st.spinner("Procesando facturas directamente en memoria..."):
             token = get_graph_token()
             if token:
-                start_str = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
-                end_str = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
-                
-                records = download_invoices_fast(token, start_str, end_str)
+                records, files_dict = download_invoices_in_memory(token, fecha_inicio, fecha_fin)
                 df_invoices = pd.DataFrame(records)
                 
                 if not df_invoices.empty:
                     df_invoices = df_invoices.sort_values(by="Fecha", ascending=True)
                     st.session_state['df_invoices_graph'] = df_invoices
-                    st.success(f"¡Sincronización instantánea! Se procesaron {len(df_invoices)} facturas.")
+                    st.session_state['files_in_memory'] = files_dict
+                    st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
                 else:
                     st.info("No se encontraron facturas en el rango de fechas seleccionado.")
 
 if 'df_invoices_graph' not in st.session_state:
     st.session_state['df_invoices_graph'] = pd.DataFrame()
+    st.session_state['files_in_memory'] = {}
 
 df = st.session_state['df_invoices_graph']
+files_dict = st.session_state['files_in_memory']
 
 if not df.empty:
     st.divider()
@@ -278,10 +243,10 @@ if not df.empty:
 
     with col1:
         st.markdown("### 🖨️ PDF Unificado (Impresión)")
-        st.caption("Junta todos los PDFs del periodo en un solo documento listo para imprimir.")
+        st.caption("Junta todos los PDFs en un solo documento listo para imprimir.")
         
         if HAS_PYPDF:
-            merged_pdf_bytes = merge_pdfs(df['Ruta'].tolist())
+            merged_pdf_bytes = merge_pdfs_from_memory(files_dict, df['Archivo'].tolist())
             if merged_pdf_bytes:
                 st.download_button(
                     label="📄 Descargar PDF Consolidado",
@@ -290,12 +255,10 @@ if not df.empty:
                     mime="application/pdf",
                     use_container_width=True
                 )
-        else:
-            st.warning("Instala `pypdf` (`pip install pypdf`) para activar la unificación de PDFs.")
 
     with col2:
         st.markdown("### 📈 Reporte Resumen XML")
-        st.caption("Excel consolidado con Subtotal, IVA, Total acumulado y desglose por proveedor.")
+        st.caption("Excel consolidado con Subtotal, IVA, Total acumulado y proveedores.")
         
         output_excel = io.BytesIO()
         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
@@ -324,14 +287,12 @@ if not df.empty:
 
     with col3:
         st.markdown("### 📦 Paquete Completo (.ZIP)")
-        st.caption("Mantiene los archivos individuales descargados en disco.")
+        st.caption("Descarga todos los PDFs en un solo archivo comprimido.")
         
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for _, row in df.iterrows():
-                file_path = row['Ruta']
-                if os.path.exists(file_path):
-                    zip_file.write(file_path, arcname=row['Archivo'])
+            for fname, fbytes in files_dict.items():
+                zip_file.writestr(fname, fbytes)
 
         st.download_button(
             label="📁 Descargar Paquete ZIP",
