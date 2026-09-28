@@ -14,11 +14,16 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-# Lee CLIENT_ID desde los Secrets de Streamlit o fallback
+# Configuración de Streamlit
+st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
+st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
+
+# Variables de configuración desde Secrets o Entorno
 CLIENT_ID = st.secrets.get("CLIENT_ID", "TU_CLIENT_ID_COPIADO_DE_AZURE")
+REFRESH_TOKEN = st.secrets.get("REFRESH_TOKEN", None)
 
 AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = ["Mail.Read"]
+SCOPES = ["Mail.Read", "offline_access"]
 
 PALABRAS_EXCLUIDAS = [
     "estado de cuenta", "resumen de cuenta", 
@@ -31,43 +36,44 @@ PALABRAS_CLAVE_PERMITIDAS = [
 ]
 
 # ---------------------------------------------------------
-# 1. AUTENTICACIÓN ADAPTADA A LA NUBE (Device Code)
+# 1. OBTENER TOKEN AUTOMÁTICO (USANDO REFRESH TOKEN)
 # ---------------------------------------------------------
-def get_graph_token():
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
-    
-    # Intentar obtener token silencioso si ya existe en la sesión de Streamlit
-    if "msal_token" in st.session_state:
-        return st.session_state["msal_token"]
-
-    # Inicio por código de dispositivo (compatible con servidores en la nube)
-    if "flow" not in st.session_state:
-        flow = app.initiate_device_flow(scopes=SCOPES)
-        if "user_code" not in flow:
-            st.error(f"Error al iniciar autenticación: {flow.get('error_description')}")
+def get_access_token():
+    # Si tenemos un REFRESH_TOKEN configurado en los Secrets de Streamlit Cloud
+    if REFRESH_TOKEN:
+        app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+        result = app.acquire_token_by_refresh_token(REFRESH_TOKEN, scopes=SCOPES)
+        if "access_token" in result:
+            return result["access_token"]
+        else:
+            st.error(f"Error renovando el token automático: {result.get('error_description')}")
             return None
-        st.session_state["flow"] = flow
+
+    # Si no hay REFRESH_TOKEN en Secrets, se muestra el generador por única vez
+    st.warning("⚠️ **Generador del Token Permanente (Paso Único)**")
+    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+
+    if "flow" not in st.session_state or st.session_state["flow"] is None:
+        st.session_state["flow"] = app.initiate_device_flow(scopes=SCOPES)
 
     flow = st.session_state["flow"]
-    
-    # Mostrar instrucciones claras al usuario
-    st.info("🔐 **Autenticación requerida para acceder a Outlook**")
+
     st.markdown(f"""
-        1. Entra a: **[{flow['verification_uri']}]({flow['verification_uri']})**
-        2. Ingresa este código: **`{flow['user_code']}`**
+        Para dejar la app funcionando 24/7 sin inicios de sesión, autoriza por **única vez** este acceso:
+        1. Abre este enlace: **[{flow['verification_uri']}]({flow['verification_uri']})**
+        2. Escribe este código: **`{flow['user_code']}`**
+        3. Presiona el botón verde de abajo después de autorizar.
     """)
 
-    if st.button("✅ Ya ingresé el código y autoricé"):
+    if st.button("🔑 Generar Refresh Token Permanente", use_container_width=True):
         result = app.acquire_token_by_device_flow(flow)
-        if "access_token" in result:
-            st.session_state["msal_token"] = result["access_token"]
-            if "flow" in st.session_state:
-                del st.session_state["flow"]
-            st.success("¡Autenticación Exitosa! Vuelve a hacer clic en 'Buscar y Descargar Facturas'.")
-            st.rerun()
+        if "refresh_token" in result:
+            st.success("¡Token Permanente generado con éxito!")
+            st.info("Copia el siguiente código exactamente como aparece y guárdalo en la sección **Secrets** de Streamlit Cloud:")
+            st.code(f'REFRESH_TOKEN = "{result["refresh_token"]}"', language="toml")
         else:
-            st.error(f"No se completó la autorización: {result.get('error_description')}")
-    
+            st.error(f"No se detectó la autorización aún. Error: {result.get('error_description')}")
+
     return None
 
 def get_quarter(month):
@@ -98,7 +104,7 @@ def parse_xml_invoice(xml_bytes):
         return None
 
 # ---------------------------------------------------------
-# 2. PROCESAMIENTO RÁPIDO EN MEMORIA
+# 2. BÚSQUEDA Y LECTURA DE FACTURAS EN MEMORIA
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -196,40 +202,35 @@ def merge_pdfs_from_memory(files_dict, filenames):
     return output_pdf.getvalue()
 
 # ---------------------------------------------------------
-# 3. INTERFAZ STREAMLIT
+# 3. INTERFAZ DE USUARIO
 # ---------------------------------------------------------
-st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
-st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
-
 st.title("📩 Control y Gestor de Facturas desde Outlook")
 st.markdown("Busca, consolida datos financieros de facturas y unifica documentos para impresión.")
 
-st.sidebar.header("🎯 Rango de Fechas a Consultar")
-fecha_inicio = st.sidebar.date_input("Fecha Inicio", datetime.date(2026, 9, 1))
-fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 9, 28))
+access_token = get_access_token()
 
-st.sidebar.divider()
+if access_token:
+    st.sidebar.success("🟢 Conexión directa a Outlook activa")
+    st.sidebar.header("🎯 Rango de Fechas")
+    fecha_inicio = st.sidebar.date_input("Fecha Inicio", datetime.date(2026, 9, 1))
+    fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 9, 28))
 
-if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=True):
-    if CLIENT_ID == "TU_CLIENT_ID_COPIADO_DE_AZURE":
-        st.sidebar.error("Por favor configura tu Client ID de Azure en Secrets.")
-    else:
-        token = get_graph_token()
-        if token:
-            with st.spinner("Procesando facturas..."):
-                records, files_dict = download_invoices_in_memory(token, fecha_inicio, fecha_fin)
-                df_invoices = pd.DataFrame(records)
-                
-                if not df_invoices.empty:
-                    df_invoices = df_invoices.sort_values(by="Fecha", ascending=True)
-                    st.session_state['df_invoices_graph'] = df_invoices
-                    st.session_state['files_in_memory'] = files_dict
-                    st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
-                else:
-                    st.info("No se encontraron facturas en el rango de fechas seleccionado.")
+    if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=True):
+        with st.spinner("Consultando facturas en Outlook..."):
+            records, files_dict = download_invoices_in_memory(access_token, fecha_inicio, fecha_fin)
+            df_invoices = pd.DataFrame(records)
+            
+            if not df_invoices.empty:
+                df_invoices = df_invoices.sort_values(by="Fecha", ascending=True)
+                st.session_state['df_invoices_graph'] = df_invoices
+                st.session_state['files_in_memory'] = files_dict
+                st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
+            else:
+                st.info("No se encontraron facturas en el rango de fechas seleccionado.")
 
 if 'df_invoices_graph' not in st.session_state:
     st.session_state['df_invoices_graph'] = pd.DataFrame()
+if 'files_in_memory' not in st.session_state:
     st.session_state['files_in_memory'] = {}
 
 df = st.session_state['df_invoices_graph']
@@ -237,7 +238,7 @@ files_dict = st.session_state['files_in_memory']
 
 if not df.empty:
     st.divider()
-    st.subheader("📊 Consolidado de Datos Financieros del Trimestre")
+    st.subheader("📊 Consolidado de Datos Financieros")
     
     total_subtotal = df['Subtotal'].sum()
     total_iva = df['IVA'].sum()
@@ -260,24 +261,20 @@ if not df.empty:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.markdown("### 🖨️ PDF Unificado (Impresión)")
-        st.caption("Junta todos los PDFs en un solo documento listo para imprimir.")
-        
+        st.markdown("### 🖨️ PDF Unificado")
         if HAS_PYPDF:
             merged_pdf_bytes = merge_pdfs_from_memory(files_dict, df['Archivo'].tolist())
             if merged_pdf_bytes:
                 st.download_button(
                     label="📄 Descargar PDF Consolidado",
                     data=merged_pdf_bytes,
-                    file_name=f"Facturas_Consolidadas_{fecha_inicio}_al_{fecha_fin}.pdf",
+                    file_name=f"Facturas_Consolidadas.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
 
     with col2:
         st.markdown("### 📈 Reporte Resumen XML")
-        st.caption("Excel consolidado con Subtotal, IVA, Total acumulado y proveedores.")
-        
         output_excel = io.BytesIO()
         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
             df[['Fecha', 'Trimestre', 'Proveedor', 'Subtotal', 'IVA', 'Total', 'Asunto', 'Archivo']].to_excel(
@@ -287,7 +284,6 @@ if not df.empty:
             df_prov.to_excel(writer, index=False, sheet_name='Desglose_Por_Proveedor')
 
             df_resumen = pd.DataFrame([{
-                "Rango Fechas": f"{fecha_inicio} al {fecha_fin}",
                 "Cant. Facturas": len(df),
                 "Subtotal Acumulado": total_subtotal,
                 "IVA Acumulado": total_iva,
@@ -298,15 +294,13 @@ if not df.empty:
         st.download_button(
             label="📊 Descargar Reporte Resumen (XML)",
             data=output_excel.getvalue(),
-            file_name=f"Reporte_Resumen_Consolidado_{fecha_inicio}_al_{fecha_fin}.xlsx",
+            file_name=f"Reporte_Resumen.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
 
     with col3:
         st.markdown("### 📦 Paquete Completo (.ZIP)")
-        st.caption("Descarga todos los PDFs en un solo archivo comprimido.")
-        
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for fname, fbytes in files_dict.items():
@@ -315,9 +309,7 @@ if not df.empty:
         st.download_button(
             label="📁 Descargar Paquete ZIP",
             data=zip_buffer.getvalue(),
-            file_name=f"Facturas_Archivos_{fecha_inicio}_al_{fecha_fin}.zip",
+            file_name=f"Facturas_Archivos.zip",
             mime="application/zip",
             use_container_width=True
         )
-else:
-    st.info("Selecciona el rango de fechas en el panel izquierdo y haz clic en **'Buscar y Descargar Facturas'**.")
