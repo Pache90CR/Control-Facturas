@@ -18,12 +18,12 @@ except ImportError:
 st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
-# Variables de configuración desde Secrets o Entorno
+# Variables de configuración desde Secrets
 CLIENT_ID = st.secrets.get("CLIENT_ID", "TU_CLIENT_ID_COPIADO_DE_AZURE")
 REFRESH_TOKEN = st.secrets.get("REFRESH_TOKEN", None)
 
 AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = ["Mail.Read", "offline_access"]
+SCOPES = ["Mail.Read"]  # MSAL maneja offline_access automáticamente
 
 PALABRAS_EXCLUIDAS = [
     "estado de cuenta", "resumen de cuenta", 
@@ -36,40 +36,40 @@ PALABRAS_CLAVE_PERMITIDAS = [
 ]
 
 # ---------------------------------------------------------
-# 1. OBTENER TOKEN AUTOMÁTICO (USANDO REFRESH TOKEN)
+# 1. AUTENTICACIÓN AUTOMÁTICA O GENERADOR
 # ---------------------------------------------------------
 def get_access_token():
-    # Si tenemos un REFRESH_TOKEN configurado en los Secrets de Streamlit Cloud
+    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+
+    # Si ya guardaste el REFRESH_TOKEN en Secrets
     if REFRESH_TOKEN:
-        app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
         result = app.acquire_token_by_refresh_token(REFRESH_TOKEN, scopes=SCOPES)
         if "access_token" in result:
             return result["access_token"]
         else:
-            st.error(f"Error renovando el token automático: {result.get('error_description')}")
+            st.error(f"Error al renovar el token: {result.get('error_description')}")
             return None
 
-    # Si no hay REFRESH_TOKEN en Secrets, se muestra el generador por única vez
+    # Si aún no hay REFRESH_TOKEN, se genera
     st.warning("⚠️ **Generador del Token Permanente (Paso Único)**")
-    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
 
     if "flow" not in st.session_state or st.session_state["flow"] is None:
-        st.session_state["flow"] = app.initiate_device_flow(scopes=SCOPES)
+        # Para el device flow sí podemos incluir offline_access para asegurar el token
+        st.session_state["flow"] = app.initiate_device_flow(scopes=["Mail.Read", "offline_access"])
 
     flow = st.session_state["flow"]
 
     st.markdown(f"""
-        Para dejar la app funcionando 24/7 sin inicios de sesión, autoriza por **única vez** este acceso:
         1. Abre este enlace: **[{flow['verification_uri']}]({flow['verification_uri']})**
         2. Escribe este código: **`{flow['user_code']}`**
-        3. Presiona el botón verde de abajo después de autorizar.
+        3. Presiona el botón verde de abajo después de autorizar en Microsoft.
     """)
 
     if st.button("🔑 Generar Refresh Token Permanente", use_container_width=True):
         result = app.acquire_token_by_device_flow(flow)
         if "refresh_token" in result:
             st.success("¡Token Permanente generado con éxito!")
-            st.info("Copia el siguiente código exactamente como aparece y guárdalo en la sección **Secrets** de Streamlit Cloud:")
+            st.info("Copia la siguiente línea completa y pégala en la sección **Secrets** de Streamlit Cloud:")
             st.code(f'REFRESH_TOKEN = "{result["refresh_token"]}"', language="toml")
         else:
             st.error(f"No se detectó la autorización aún. Error: {result.get('error_description')}")
