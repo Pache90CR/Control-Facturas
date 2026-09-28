@@ -14,7 +14,9 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-CLIENT_ID = "6f6074bd-8f47-4589-a691-7a05cebae707"
+# Lee CLIENT_ID desde los Secrets de Streamlit o fallback
+CLIENT_ID = st.secrets.get("CLIENT_ID", "TU_CLIENT_ID_COPIADO_DE_AZURE")
+
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read"]
 
@@ -29,26 +31,44 @@ PALABRAS_CLAVE_PERMITIDAS = [
 ]
 
 # ---------------------------------------------------------
-# 1. AUTENTICACIÓN
+# 1. AUTENTICACIÓN ADAPTADA A LA NUBE (Device Code)
 # ---------------------------------------------------------
 def get_graph_token():
     app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
-    accounts = app.get_accounts()
-    result = None
-    if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
-    if not result:
-        try:
-            result = app.acquire_token_interactive(scopes=SCOPES)
-        except Exception as e:
-            st.error(f"Error de autenticación: {e}")
-            return None
+    
+    # Intentar obtener token silencioso si ya existe en la sesión de Streamlit
+    if "msal_token" in st.session_state:
+        return st.session_state["msal_token"]
 
-    if result and "access_token" in result:
-        return result["access_token"]
-    else:
-        st.error("No se pudo obtener el token de acceso.")
-        return None
+    # Inicio por código de dispositivo (compatible con servidores en la nube)
+    if "flow" not in st.session_state:
+        flow = app.initiate_device_flow(scopes=SCOPES)
+        if "user_code" not in flow:
+            st.error(f"Error al iniciar autenticación: {flow.get('error_description')}")
+            return None
+        st.session_state["flow"] = flow
+
+    flow = st.session_state["flow"]
+    
+    # Mostrar instrucciones claras al usuario
+    st.info("🔐 **Autenticación requerida para acceder a Outlook**")
+    st.markdown(f"""
+        1. Entra a: **[{flow['verification_uri']}]({flow['verification_uri']})**
+        2. Ingresa este código: **`{flow['user_code']}`**
+    """)
+
+    if st.button("✅ Ya ingresé el código y autoricé"):
+        result = app.acquire_token_by_device_flow(flow)
+        if "access_token" in result:
+            st.session_state["msal_token"] = result["access_token"]
+            if "flow" in st.session_state:
+                del st.session_state["flow"]
+            st.success("¡Autenticación Exitosa! Vuelve a hacer clic en 'Buscar y Descargar Facturas'.")
+            st.rerun()
+        else:
+            st.error(f"No se completó la autorización: {result.get('error_description')}")
+    
+    return None
 
 def get_quarter(month):
     if month in [1, 2, 3]: return "Q1 (Ene-Mar)"
@@ -78,7 +98,7 @@ def parse_xml_invoice(xml_bytes):
         return None
 
 # ---------------------------------------------------------
-# 2. PROCESAMIENTO EN MEMORIA RAM (SÚPER RÁPIDO)
+# 2. PROCESAMIENTO RÁPIDO EN MEMORIA
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -99,7 +119,7 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
 
     messages = response.json().get('value', [])
     records = []
-    files_in_memory = {}  # Guarda los bytes en memoria en lugar de disco
+    files_in_memory = {}
 
     for msg in messages:
         subject = msg.get('subject') or "Sin Asunto"
@@ -125,7 +145,6 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
             attachments = attach_res.json().get('value', [])
             xml_data = None
             pdf_filename = ""
-            pdf_bytes = None
 
             for att in attachments:
                 name = att.get('name', '')
@@ -143,7 +162,6 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
 
                     if es_pdf:
                         pdf_filename = safe_filename
-                        pdf_bytes = file_bytes
                         files_in_memory[safe_filename] = file_bytes
                     elif es_xml and not xml_data:
                         xml_data = parse_xml_invoice(file_bytes)
@@ -187,18 +205,18 @@ st.title("📩 Control y Gestor de Facturas desde Outlook")
 st.markdown("Busca, consolida datos financieros de facturas y unifica documentos para impresión.")
 
 st.sidebar.header("🎯 Rango de Fechas a Consultar")
-fecha_inicio = st.sidebar.date_input("Fecha Inicio", datetime.date(2026, 1, 1))
-fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 3, 31))
+fecha_inicio = st.sidebar.date_input("Fecha Inicio", datetime.date(2026, 9, 1))
+fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 9, 28))
 
 st.sidebar.divider()
 
 if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=True):
     if CLIENT_ID == "TU_CLIENT_ID_COPIADO_DE_AZURE":
-        st.sidebar.error("Por favor pega tu Client ID de Azure en la variable CLIENT_ID de app.py.")
+        st.sidebar.error("Por favor configura tu Client ID de Azure en Secrets.")
     else:
-        with st.spinner("Procesando facturas directamente en memoria..."):
-            token = get_graph_token()
-            if token:
+        token = get_graph_token()
+        if token:
+            with st.spinner("Procesando facturas..."):
                 records, files_dict = download_invoices_in_memory(token, fecha_inicio, fecha_fin)
                 df_invoices = pd.DataFrame(records)
                 
