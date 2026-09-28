@@ -14,16 +14,16 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-# Configuración de Streamlit
+# Configuración de la aplicación
 st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
-# Variables de configuración desde Secrets
+# Cargar credenciales desde Secrets de Streamlit Cloud
 CLIENT_ID = st.secrets.get("CLIENT_ID", "TU_CLIENT_ID_COPIADO_DE_AZURE")
 REFRESH_TOKEN = st.secrets.get("REFRESH_TOKEN", None)
 
 AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = ["Mail.Read"]  # MSAL maneja offline_access automáticamente
+SCOPES = ["Mail.Read"]
 
 PALABRAS_EXCLUIDAS = [
     "estado de cuenta", "resumen de cuenta", 
@@ -36,33 +36,32 @@ PALABRAS_CLAVE_PERMITIDAS = [
 ]
 
 # ---------------------------------------------------------
-# 1. AUTENTICACIÓN AUTOMÁTICA O GENERADOR
+# 1. AUTENTICACIÓN
 # ---------------------------------------------------------
 def get_access_token():
     app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
 
-    # Si ya guardaste el REFRESH_TOKEN en Secrets
+    # Si el REFRESH_TOKEN ya está guardado en Secrets, genera el access_token sin pedir nada
     if REFRESH_TOKEN:
         result = app.acquire_token_by_refresh_token(REFRESH_TOKEN, scopes=SCOPES)
         if "access_token" in result:
             return result["access_token"]
         else:
-            st.error(f"Error al renovar el token: {result.get('error_description')}")
+            st.error(f"Error al renovar el token automático: {result.get('error_description')}")
             return None
 
-    # Si aún no hay REFRESH_TOKEN, se genera
+    # Si aún no hay REFRESH_TOKEN en Secrets, se genera en pantalla
     st.warning("⚠️ **Generador del Token Permanente (Paso Único)**")
 
     if "flow" not in st.session_state or st.session_state["flow"] is None:
-        # Para el device flow sí podemos incluir offline_access para asegurar el token
-        st.session_state["flow"] = app.initiate_device_flow(scopes=["Mail.Read", "offline_access"])
+        st.session_state["flow"] = app.initiate_device_flow(scopes=SCOPES)
 
     flow = st.session_state["flow"]
 
     st.markdown(f"""
         1. Abre este enlace: **[{flow['verification_uri']}]({flow['verification_uri']})**
         2. Escribe este código: **`{flow['user_code']}`**
-        3. Presiona el botón verde de abajo después de autorizar en Microsoft.
+        3. Autoriza el acceso en Microsoft y luego presiona el botón verde de abajo.
     """)
 
     if st.button("🔑 Generar Refresh Token Permanente", use_container_width=True):
@@ -104,7 +103,7 @@ def parse_xml_invoice(xml_bytes):
         return None
 
 # ---------------------------------------------------------
-# 2. BÚSQUEDA Y LECTURA DE FACTURAS EN MEMORIA
+# 2. PROCESAMIENTO EN MEMORIA RAM
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -202,7 +201,7 @@ def merge_pdfs_from_memory(files_dict, filenames):
     return output_pdf.getvalue()
 
 # ---------------------------------------------------------
-# 3. INTERFAZ DE USUARIO
+# 3. INTERFAZ STREAMLIT
 # ---------------------------------------------------------
 st.title("📩 Control y Gestor de Facturas desde Outlook")
 st.markdown("Busca, consolida datos financieros de facturas y unifica documentos para impresión.")
