@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import requests
 import msal
+import unicodedata
 
 try:
     from pypdf import PdfWriter
@@ -14,7 +15,7 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-# Configuración de la aplicación
+# Configuración de la página
 st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
@@ -26,14 +27,20 @@ AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read"]
 
 PALABRAS_EXCLUIDAS = [
-    "estado de cuenta", "resumen de cuenta", 
-    "extracto", "boletin", "publicidad", "oferta"
+    "boletin", "publicidad", "oferta", "newsletter", "promocion"
 ]
 
 PALABRAS_CLAVE_PERMITIDAS = [
     "factura", "comprobante", "electronico", "electronica", 
-    "tiquete", "nota de credito", "documento electronico", "fe-"
+    "tiquete", "nota de credito", "documento electronico", "fe-",
+    "fe_", "nc-", "ticket", "recibo", "xml", "pdf"
 ]
+
+def limpiar_texto(texto):
+    if not texto: return ""
+    # Quitar tildes y pasar a minúsculas
+    texto_norm = unicodedata.normalize('NFD', texto)
+    return "".join(c for c in texto_norm if unicodedata.category(c) != 'Mn').lower()
 
 # ---------------------------------------------------------
 # 1. AUTENTICACIÓN
@@ -41,7 +48,6 @@ PALABRAS_CLAVE_PERMITIDAS = [
 def get_access_token():
     app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
 
-    # Si el REFRESH_TOKEN ya está guardado en Secrets, genera el access_token sin pedir nada
     if REFRESH_TOKEN:
         result = app.acquire_token_by_refresh_token(REFRESH_TOKEN, scopes=SCOPES)
         if "access_token" in result:
@@ -50,7 +56,6 @@ def get_access_token():
             st.error(f"Error al renovar el token automático: {result.get('error_description')}")
             return None
 
-    # Si aún no hay REFRESH_TOKEN en Secrets, se genera en pantalla
     st.warning("⚠️ **Generador del Token Permanente (Paso Único)**")
 
     if "flow" not in st.session_state or st.session_state["flow"] is None:
@@ -61,7 +66,7 @@ def get_access_token():
     st.markdown(f"""
         1. Abre este enlace: **[{flow['verification_uri']}]({flow['verification_uri']})**
         2. Escribe este código: **`{flow['user_code']}`**
-        3. Autoriza el acceso en Microsoft y luego presiona el botón verde de abajo.
+        3. Autoriza el acceso en Microsoft y presiona el botón verde de abajo.
     """)
 
     if st.button("🔑 Generar Refresh Token Permanente", use_container_width=True):
@@ -103,18 +108,20 @@ def parse_xml_invoice(xml_bytes):
         return None
 
 # ---------------------------------------------------------
-# 2. PROCESAMIENTO EN MEMORIA RAM
+# 2. BÚSQUEDA OPTIMIZADA EN OUTLOOK
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
+    
+    # Ajustar para incluir el día entero completo (desde las 00:00:00 hasta las 23:59:59)
     start_iso = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
-    end_iso = fecha_fin.strftime('%Y-%m-%dT23:59:59Z')
+    end_iso = (fecha_fin + datetime.timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
 
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
         f"?$filter=hasAttachments eq true and receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
         "&$select=id,subject,from,receivedDateTime"
-        "&$top=100"
+        "&$top=150"
     )
     
     response = requests.get(endpoint, headers=headers)
@@ -127,10 +134,11 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     files_in_memory = {}
 
     for msg in messages:
-        subject = msg.get('subject') or "Sin Asunto"
-        subject_lower = subject.lower()
+        subject_raw = msg.get('subject') or "Sin Asunto"
+        subject_clean = limpiar_texto(subject_raw)
 
-        if any(excl in subject_lower for excl in PALABRAS_EXCLUIDAS):
+        # Omitir únicamente si es spam/boletín explícito
+        if any(excl in subject_clean for excl in PALABRAS_EXCLUIDAS):
             continue
 
         msg_id = msg['id']
@@ -152,18 +160,17 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
             pdf_filename = ""
 
             for att in attachments:
-                name = att.get('name', '')
-                name_lower = name.lower()
+                name_raw = att.get('name', '')
+                name_clean = limpiar_texto(name_raw)
 
-                es_pdf = name_lower.endswith('.pdf')
-                es_xml = name_lower.endswith('.xml')
-                es_factura = any(p in subject_lower for p in PALABRAS_CLAVE_PERMITIDAS) or \
-                             any(p in name_lower for p in PALABRAS_CLAVE_PERMITIDAS)
-
-                if (es_pdf or es_xml) and es_factura and 'contentBytes' in att:
+                es_pdf = name_clean.endswith('.pdf')
+                es_xml = name_clean.endswith('.xml')
+                
+                # Criterio de aceptación más amplio: tener PDF o XML adjunto
+                if (es_pdf or es_xml) and 'contentBytes' in att:
                     import base64
                     file_bytes = base64.b64decode(att['contentBytes'])
-                    safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name}"
+                    safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name_raw}"
 
                     if es_pdf:
                         pdf_filename = safe_filename
@@ -180,7 +187,7 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
                     "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
                     "IVA": xml_data["IVA"] if xml_data else 0.0,
                     "Total": xml_data["Total"] if xml_data else 0.0,
-                    "Asunto": subject,
+                    "Asunto": subject_raw,
                     "Archivo": pdf_filename
                 })
 
