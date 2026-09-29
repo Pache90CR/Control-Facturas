@@ -59,7 +59,7 @@ def get_access_token():
     return None
 
 # ---------------------------------------------------------
-# 2. BÚSQUEDA PROFUNDA (CON DIAGNÓSTICO)
+# 2. BÚSQUEDA SIMPLIFICADA (EVITA COLAPSO DE MICROSOFT)
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -67,12 +67,11 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     start_iso = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
     end_iso = (fecha_fin + datetime.timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
 
-    # Añadimos $orderby para traer los más recientes primero
+    # Consulta súper simple a Microsoft (Solo fechas, sin filtros complejos ni ordenamiento)
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
-        f"?$filter=hasAttachments eq true and receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
-        "&$select=id,subject,from,receivedDateTime"
-        "&$orderby=receivedDateTime desc"
+        f"?$filter=receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
+        "&$select=id,subject,from,receivedDateTime,hasAttachments"
         "&$top=100"
     )
     
@@ -80,26 +79,29 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     files_in_memory = {}
     logs = []
     
-    logs.append(f"Consultando desde {start_iso} hasta {end_iso}...")
+    logs.append(f"Consultando fechas desde {start_iso} hasta {end_iso}...")
     
     url = endpoint
     messages = []
     
-    # Paginación (Buscar hasta 300 correos)
-    while url and len(messages) < 300:
+    # Extraer correos (hasta 500)
+    while url and len(messages) < 500:
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
             data = res.json()
-            mensajes_pagina = data.get('value', [])
-            messages.extend(mensajes_pagina)
-            url = data.get('@odata.nextLink') # Ir a la siguiente página si hay más de 100
+            messages.extend(data.get('value', []))
+            url = data.get('@odata.nextLink')
         else:
             logs.append(f"Error de Microsoft Graph: {res.status_code} - {res.text}")
             break
 
-    logs.append(f"Se encontraron un total de {len(messages)} correos con archivos adjuntos.")
+    logs.append(f"Se descargó la lista de {len(messages)} correos. Filtrando adjuntos en Python...")
 
     for msg in messages:
+        # Filtrado de Python (Más eficiente y sin errores)
+        if not msg.get('hasAttachments'):
+            continue
+
         subject_raw = msg.get('subject') or "Sin Asunto"
         msg_id = msg['id']
         sender_info = msg.get('from', {}).get('emailAddress', {}) if msg.get('from') else {}
@@ -115,8 +117,6 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
         
         if attach_res.status_code == 200:
             attachments = attach_res.json().get('value', [])
-            logs.append(f"   -> Tiene {len(attachments)} archivo(s) adjunto(s).")
-            
             xml_data = None
             pdf_filename = ""
 
@@ -128,7 +128,6 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
                 es_xml = name_clean.endswith('.xml')
                 
                 if es_pdf or es_xml:
-                    logs.append(f"   ✅ Archivo válido encontrado: {name_raw}")
                     if 'contentBytes' in att:
                         import base64
                         file_bytes = base64.b64decode(att['contentBytes'])
@@ -137,6 +136,7 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
                         if es_pdf:
                             pdf_filename = safe_filename
                             files_in_memory[safe_filename] = file_bytes
+                            logs.append(f"   ✅ PDF guardado: {name_raw}")
                         elif es_xml and not xml_data:
                             try:
                                 root = ET.fromstring(file_bytes)
@@ -148,12 +148,12 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
                                 total = float(find_t("TotalComprobante") or 0)
                                 subtotal = float(find_t("TotalVentaNeto") or total)
                                 xml_data = {"Prov": emisor, "Sub": subtotal, "Tot": total}
+                                logs.append(f"   ✅ XML procesado. Total: ₡{total}")
                             except:
                                 xml_data = {"Prov": sender, "Sub": 0.0, "Tot": 0.0}
-                    else:
-                        logs.append(f"   ❌ El archivo {name_raw} no tiene contenido descargable (posible enlace).")
+                                logs.append(f"   ⚠️ XML leído pero sin formato estándar de factura.")
                 else:
-                    logs.append(f"   ⏭️ Ignorado: {name_raw} (No es PDF ni XML)")
+                    logs.append(f"   ⏭️ Ignorado: {name_raw} (No es PDF/XML)")
 
             if pdf_filename:
                 records.append({
@@ -179,7 +179,7 @@ if access_token:
     fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 9, 28))
 
     if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=True):
-        with st.spinner("Buscando a profundidad (esto puede tomar unos segundos)..."):
+        with st.spinner("Buscando facturas (Puede tardar de 10 a 30 segundos)..."):
             records, files_dict, logs = download_invoices_in_memory(access_token, fecha_inicio, fecha_fin)
             df_invoices = pd.DataFrame(records)
             
@@ -190,10 +190,10 @@ if access_token:
             if not df_invoices.empty:
                 st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
             else:
-                st.error("No se encontraron facturas en el rango seleccionado.")
+                st.error("Búsqueda completada, pero no se encontraron PDFs ni XMLs en las fechas.")
 
 if 'logs' in st.session_state and st.session_state['logs']:
-    with st.expander("🛠️ MODO DIAGNÓSTICO: Haz clic aquí para ver qué correos revisó la app"):
+    with st.expander("🛠️ MODO DIAGNÓSTICO: Haz clic aquí para ver qué ocurrió"):
         for linea in st.session_state['logs']:
             st.text(linea)
 
@@ -204,7 +204,7 @@ if 'df_invoices_graph' in st.session_state and not st.session_state['df_invoices
     st.divider()
     col_m1, col_m2 = st.columns(2)
     col_m1.metric("Facturas Procesadas", len(df))
-    col_m2.metric("Total Acumulado (XMLs procesados)", f"₡{df['Total'].sum():,.2f}")
+    col_m2.metric("Total Acumulado", f"₡{df['Total'].sum():,.2f}")
 
     st.dataframe(df, use_container_width=True)
 
