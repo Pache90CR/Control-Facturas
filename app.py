@@ -15,30 +15,16 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
-# Configuración de la página
 st.set_page_config(page_title="Control de Facturas - Outlook", page_icon="📩", layout="wide")
 st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
 
-# Cargar credenciales desde Secrets de Streamlit Cloud
 CLIENT_ID = st.secrets.get("CLIENT_ID", "TU_CLIENT_ID_COPIADO_DE_AZURE")
 REFRESH_TOKEN = st.secrets.get("REFRESH_TOKEN", None)
-
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read"]
 
-PALABRAS_EXCLUIDAS = [
-    "boletin", "publicidad", "oferta", "newsletter", "promocion"
-]
-
-PALABRAS_CLAVE_PERMITIDAS = [
-    "factura", "comprobante", "electronico", "electronica", 
-    "tiquete", "nota de credito", "documento electronico", "fe-",
-    "fe_", "nc-", "ticket", "recibo", "xml", "pdf"
-]
-
 def limpiar_texto(texto):
     if not texto: return ""
-    # Quitar tildes y pasar a minúsculas
     texto_norm = unicodedata.normalize('NFD', texto)
     return "".join(c for c in texto_norm if unicodedata.category(c) != 'Mn').lower()
 
@@ -53,109 +39,84 @@ def get_access_token():
         if "access_token" in result:
             return result["access_token"]
         else:
-            st.error(f"Error al renovar el token automático: {result.get('error_description')}")
+            st.error(f"Error con el token permanente: {result.get('error_description')}")
             return None
 
-    st.warning("⚠️ **Generador del Token Permanente (Paso Único)**")
-
+    st.warning("⚠️ **Generador de Token Permanente (Paso Único)**")
     if "flow" not in st.session_state or st.session_state["flow"] is None:
         st.session_state["flow"] = app.initiate_device_flow(scopes=SCOPES)
-
     flow = st.session_state["flow"]
 
     st.markdown(f"""
-        1. Abre este enlace: **[{flow['verification_uri']}]({flow['verification_uri']})**
+        1. Entra a: **[{flow['verification_uri']}]({flow['verification_uri']})**
         2. Escribe este código: **`{flow['user_code']}`**
-        3. Autoriza el acceso en Microsoft y presiona el botón verde de abajo.
     """)
-
-    if st.button("🔑 Generar Refresh Token Permanente", use_container_width=True):
+    if st.button("🔑 Generar Refresh Token", use_container_width=True):
         result = app.acquire_token_by_device_flow(flow)
         if "refresh_token" in result:
-            st.success("¡Token Permanente generado con éxito!")
-            st.info("Copia la siguiente línea completa y pégala en la sección **Secrets** de Streamlit Cloud:")
+            st.success("Copia esto en Secrets de Streamlit:")
             st.code(f'REFRESH_TOKEN = "{result["refresh_token"]}"', language="toml")
-        else:
-            st.error(f"No se detectó la autorización aún. Error: {result.get('error_description')}")
-
     return None
 
-def get_quarter(month):
-    if month in [1, 2, 3]: return "Q1 (Ene-Mar)"
-    elif month in [4, 5, 6]: return "Q2 (Abr-Jun)"
-    elif month in [7, 8, 9]: return "Q3 (Jul-Sep)"
-    else: return "Q4 (Oct-Dic)"
-
-def parse_xml_invoice(xml_bytes):
-    try:
-        root = ET.fromstring(xml_bytes)
-        def find_text(tag_name):
-            for elem in root.iter():
-                if elem.tag.endswith(tag_name):
-                    return elem.text
-            return "0"
-
-        emisor = find_text("Nombre") or "Proveedor Desconocido"
-        subtotal = float(find_text("TotalComprobante") or find_text("TotalVentaNeto") or 0)
-        iva = float(find_text("TotalImpuesto") or 0)
-        total = float(find_text("TotalComprobante") or 0)
-
-        if subtotal == total and iva > 0:
-            subtotal = total - iva
-
-        return {"Proveedor": emisor, "Subtotal": subtotal, "IVA": iva, "Total": total}
-    except Exception:
-        return None
-
 # ---------------------------------------------------------
-# 2. BÚSQUEDA OPTIMIZADA EN OUTLOOK
+# 2. BÚSQUEDA PROFUNDA (CON DIAGNÓSTICO)
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
     
-    # Ajustar para incluir el día entero completo (desde las 00:00:00 hasta las 23:59:59)
     start_iso = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
     end_iso = (fecha_fin + datetime.timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
 
+    # Añadimos $orderby para traer los más recientes primero
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
         f"?$filter=hasAttachments eq true and receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
         "&$select=id,subject,from,receivedDateTime"
-        "&$top=150"
+        "&$orderby=receivedDateTime desc"
+        "&$top=100"
     )
     
-    response = requests.get(endpoint, headers=headers)
-    if response.status_code != 200:
-        st.error(f"Error consultando Microsoft Graph: {response.status_code}")
-        return [], {}
-
-    messages = response.json().get('value', [])
     records = []
     files_in_memory = {}
+    logs = []
+    
+    logs.append(f"Consultando desde {start_iso} hasta {end_iso}...")
+    
+    url = endpoint
+    messages = []
+    
+    # Paginación (Buscar hasta 300 correos)
+    while url and len(messages) < 300:
+        res = requests.get(url, headers=headers)
+        if res.status_code == 200:
+            data = res.json()
+            mensajes_pagina = data.get('value', [])
+            messages.extend(mensajes_pagina)
+            url = data.get('@odata.nextLink') # Ir a la siguiente página si hay más de 100
+        else:
+            logs.append(f"Error de Microsoft Graph: {res.status_code} - {res.text}")
+            break
+
+    logs.append(f"Se encontraron un total de {len(messages)} correos con archivos adjuntos.")
 
     for msg in messages:
         subject_raw = msg.get('subject') or "Sin Asunto"
-        subject_clean = limpiar_texto(subject_raw)
-
-        # Omitir únicamente si es spam/boletín explícito
-        if any(excl in subject_clean for excl in PALABRAS_EXCLUIDAS):
-            continue
-
         msg_id = msg['id']
         sender_info = msg.get('from', {}).get('emailAddress', {}) if msg.get('from') else {}
         sender = f"{sender_info.get('name', '')} <{sender_info.get('address', '')}>"
         
         raw_date = msg.get('receivedDateTime')
         msg_date = datetime.datetime.fromisoformat(raw_date.replace('Z', '+00:00')) if raw_date else datetime.datetime.now()
+        
+        logs.append(f"📥 Revisando: '{subject_raw}' (De: {sender})")
 
-        year = str(msg_date.year)
-        quarter = get_quarter(msg_date.month)
-
-        attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments?$select=id,name,contentBytes"
+        attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments"
         attach_res = requests.get(attach_endpoint, headers=headers)
         
         if attach_res.status_code == 200:
             attachments = attach_res.json().get('value', [])
+            logs.append(f"   -> Tiene {len(attachments)} archivo(s) adjunto(s).")
+            
             xml_data = None
             pdf_filename = ""
 
@@ -166,156 +127,103 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
                 es_pdf = name_clean.endswith('.pdf')
                 es_xml = name_clean.endswith('.xml')
                 
-                # Criterio de aceptación más amplio: tener PDF o XML adjunto
-                if (es_pdf or es_xml) and 'contentBytes' in att:
-                    import base64
-                    file_bytes = base64.b64decode(att['contentBytes'])
-                    safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name_raw}"
+                if es_pdf or es_xml:
+                    logs.append(f"   ✅ Archivo válido encontrado: {name_raw}")
+                    if 'contentBytes' in att:
+                        import base64
+                        file_bytes = base64.b64decode(att['contentBytes'])
+                        safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name_raw}"
 
-                    if es_pdf:
-                        pdf_filename = safe_filename
-                        files_in_memory[safe_filename] = file_bytes
-                    elif es_xml and not xml_data:
-                        xml_data = parse_xml_invoice(file_bytes)
+                        if es_pdf:
+                            pdf_filename = safe_filename
+                            files_in_memory[safe_filename] = file_bytes
+                        elif es_xml and not xml_data:
+                            try:
+                                root = ET.fromstring(file_bytes)
+                                def find_t(tag):
+                                    for el in root.iter():
+                                        if el.tag.endswith(tag): return el.text
+                                    return "0"
+                                emisor = find_t("Nombre") or "Proveedor"
+                                total = float(find_t("TotalComprobante") or 0)
+                                subtotal = float(find_t("TotalVentaNeto") or total)
+                                xml_data = {"Prov": emisor, "Sub": subtotal, "Tot": total}
+                            except:
+                                xml_data = {"Prov": sender, "Sub": 0.0, "Tot": 0.0}
+                    else:
+                        logs.append(f"   ❌ El archivo {name_raw} no tiene contenido descargable (posible enlace).")
+                else:
+                    logs.append(f"   ⏭️ Ignorado: {name_raw} (No es PDF ni XML)")
 
             if pdf_filename:
                 records.append({
                     "Fecha": msg_date.strftime('%Y-%m-%d'),
-                    "Año": year,
-                    "Trimestre": quarter,
-                    "Proveedor": xml_data["Proveedor"] if xml_data else sender,
-                    "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
-                    "IVA": xml_data["IVA"] if xml_data else 0.0,
-                    "Total": xml_data["Total"] if xml_data else 0.0,
+                    "Proveedor": xml_data["Prov"] if xml_data else sender,
+                    "Total": xml_data["Tot"] if xml_data else 0.0,
                     "Asunto": subject_raw,
                     "Archivo": pdf_filename
                 })
 
-    return records, files_in_memory
-
-def merge_pdfs_from_memory(files_dict, filenames):
-    if not HAS_PYPDF: return None
-    merger = PdfWriter()
-    for name in filenames:
-        if name in files_dict:
-            try:
-                merger.append(io.BytesIO(files_dict[name]))
-            except Exception:
-                pass
-    output_pdf = io.BytesIO()
-    merger.write(output_pdf)
-    merger.close()
-    return output_pdf.getvalue()
+    return records, files_in_memory, logs
 
 # ---------------------------------------------------------
 # 3. INTERFAZ STREAMLIT
 # ---------------------------------------------------------
 st.title("📩 Control y Gestor de Facturas desde Outlook")
-st.markdown("Busca, consolida datos financieros de facturas y unifica documentos para impresión.")
 
 access_token = get_access_token()
 
 if access_token:
-    st.sidebar.success("🟢 Conexión directa a Outlook activa")
-    st.sidebar.header("🎯 Rango de Fechas")
+    st.sidebar.success("🟢 Conexión a Outlook activa")
     fecha_inicio = st.sidebar.date_input("Fecha Inicio", datetime.date(2026, 9, 1))
     fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 9, 28))
 
     if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=True):
-        with st.spinner("Consultando facturas en Outlook..."):
-            records, files_dict = download_invoices_in_memory(access_token, fecha_inicio, fecha_fin)
+        with st.spinner("Buscando a profundidad (esto puede tomar unos segundos)..."):
+            records, files_dict, logs = download_invoices_in_memory(access_token, fecha_inicio, fecha_fin)
             df_invoices = pd.DataFrame(records)
             
+            st.session_state['df_invoices_graph'] = df_invoices
+            st.session_state['files_in_memory'] = files_dict
+            st.session_state['logs'] = logs
+            
             if not df_invoices.empty:
-                df_invoices = df_invoices.sort_values(by="Fecha", ascending=True)
-                st.session_state['df_invoices_graph'] = df_invoices
-                st.session_state['files_in_memory'] = files_dict
                 st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
             else:
-                st.info("No se encontraron facturas en el rango de fechas seleccionado.")
+                st.error("No se encontraron facturas en el rango seleccionado.")
 
-if 'df_invoices_graph' not in st.session_state:
-    st.session_state['df_invoices_graph'] = pd.DataFrame()
-if 'files_in_memory' not in st.session_state:
-    st.session_state['files_in_memory'] = {}
+if 'logs' in st.session_state and st.session_state['logs']:
+    with st.expander("🛠️ MODO DIAGNÓSTICO: Haz clic aquí para ver qué correos revisó la app"):
+        for linea in st.session_state['logs']:
+            st.text(linea)
 
-df = st.session_state['df_invoices_graph']
-files_dict = st.session_state['files_in_memory']
+if 'df_invoices_graph' in st.session_state and not st.session_state['df_invoices_graph'].empty:
+    df = st.session_state['df_invoices_graph']
+    files_dict = st.session_state['files_in_memory']
 
-if not df.empty:
     st.divider()
-    st.subheader("📊 Consolidado de Datos Financieros")
-    
-    total_subtotal = df['Subtotal'].sum()
-    total_iva = df['IVA'].sum()
-    total_general = df['Total'].sum()
-
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1, col_m2 = st.columns(2)
     col_m1.metric("Facturas Procesadas", len(df))
-    col_m2.metric("Subtotal Acumulado", f"₡{total_subtotal:,.2f}")
-    col_m3.metric("IVA Acumulado", f"₡{total_iva:,.2f}")
-    col_m4.metric("Total Acumulado", f"₡{total_general:,.2f}")
+    col_m2.metric("Total Acumulado (XMLs procesados)", f"₡{df['Total'].sum():,.2f}")
 
-    st.write("### Listado Ordenado por Fecha de Emisión")
-    st.dataframe(
-        df[['Fecha', 'Trimestre', 'Proveedor', 'Subtotal', 'IVA', 'Total', 'Asunto', 'Archivo']], 
-        use_container_width=True
-    )
+    st.dataframe(df, use_container_width=True)
 
-    st.divider()
-    st.subheader("⚡ Opciones de Descarga y Consolidación")
-    col1, col2, col3 = st.columns(3)
+    st.subheader("⚡ Descargas")
+    col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("### 🖨️ PDF Unificado")
         if HAS_PYPDF:
-            merged_pdf_bytes = merge_pdfs_from_memory(files_dict, df['Archivo'].tolist())
-            if merged_pdf_bytes:
-                st.download_button(
-                    label="📄 Descargar PDF Consolidado",
-                    data=merged_pdf_bytes,
-                    file_name=f"Facturas_Consolidadas.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
-                )
+            merger = PdfWriter()
+            for name in df['Archivo'].tolist():
+                if name in files_dict: merger.append(io.BytesIO(files_dict[name]))
+            output_pdf = io.BytesIO()
+            merger.write(output_pdf)
+            merger.close()
+            st.download_button("📄 Descargar PDF Consolidado", data=output_pdf.getvalue(), file_name="Consolidado.pdf", mime="application/pdf", use_container_width=True)
 
     with col2:
-        st.markdown("### 📈 Reporte Resumen XML")
-        output_excel = io.BytesIO()
-        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-            df[['Fecha', 'Trimestre', 'Proveedor', 'Subtotal', 'IVA', 'Total', 'Asunto', 'Archivo']].to_excel(
-                writer, index=False, sheet_name='Detalle_Por_Fecha'
-            )
-            df_prov = df.groupby('Proveedor')[['Subtotal', 'IVA', 'Total']].sum().reset_index()
-            df_prov.to_excel(writer, index=False, sheet_name='Desglose_Por_Proveedor')
-
-            df_resumen = pd.DataFrame([{
-                "Cant. Facturas": len(df),
-                "Subtotal Acumulado": total_subtotal,
-                "IVA Acumulado": total_iva,
-                "Total Acumulado": total_general
-            }])
-            df_resumen.to_excel(writer, index=False, sheet_name='Resumen_Trimestre')
-
-        st.download_button(
-            label="📊 Descargar Reporte Resumen (XML)",
-            data=output_excel.getvalue(),
-            file_name=f"Reporte_Resumen.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-
-    with col3:
-        st.markdown("### 📦 Paquete Completo (.ZIP)")
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for fname, fbytes in files_dict.items():
                 zip_file.writestr(fname, fbytes)
-
-        st.download_button(
-            label="📁 Descargar Paquete ZIP",
-            data=zip_buffer.getvalue(),
-            file_name=f"Facturas_Archivos.zip",
-            mime="application/zip",
-            use_container_width=True
-        )
+        st.download_button("📦 Descargar Paquete ZIP (Todos los PDFs)", data=zip_buffer.getvalue(), file_name="Archivos.zip", mime="application/zip", use_container_width=True)
