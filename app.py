@@ -23,6 +23,19 @@ REFRESH_TOKEN = st.secrets.get("REFRESH_TOKEN", None)
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Mail.Read"]
 
+# Palabras estrictas para DESCARTAR (Estados de cuenta, bancos, tiquetes, etc.)
+PALABRAS_EXCLUIDAS = [
+    "estado de cuenta", "resumen de cuenta", "extracto", 
+    "boletin", "publicidad", "oferta", "newsletter", "promocion",
+    "notificacion", "comercio afiliado", "tiquete", "banco nacional", "bncr"
+]
+
+# Palabras obligatorias para ACEPTAR (Solo facturas y documentos válidos)
+PALABRAS_CLAVE_PERMITIDAS = [
+    "factura", "comprobante", "electronico", "electronica", 
+    "nota de credito", "documento electronico", "fe-", "fe_"
+]
+
 def limpiar_texto(texto):
     if not texto: return ""
     texto_norm = unicodedata.normalize('NFD', texto)
@@ -58,8 +71,35 @@ def get_access_token():
             st.code(f'REFRESH_TOKEN = "{result["refresh_token"]}"', language="toml")
     return None
 
+def get_quarter(month):
+    if month in [1, 2, 3]: return "Q1 (Ene-Mar)"
+    elif month in [4, 5, 6]: return "Q2 (Abr-Jun)"
+    elif month in [7, 8, 9]: return "Q3 (Jul-Sep)"
+    else: return "Q4 (Oct-Dic)"
+
+def parse_xml_invoice(xml_bytes):
+    try:
+        root = ET.fromstring(xml_bytes)
+        def find_text(tag_name):
+            for elem in root.iter():
+                if elem.tag.endswith(tag_name):
+                    return elem.text
+            return "0"
+
+        emisor = find_text("Nombre") or "Proveedor Desconocido"
+        subtotal = float(find_text("TotalComprobante") or find_text("TotalVentaNeto") or 0)
+        iva = float(find_text("TotalImpuesto") or 0)
+        total = float(find_text("TotalComprobante") or 0)
+
+        if subtotal == total and iva > 0:
+            subtotal = total - iva
+
+        return {"Proveedor": emisor, "Subtotal": subtotal, "IVA": iva, "Total": total}
+    except Exception:
+        return None
+
 # ---------------------------------------------------------
-# 2. BÚSQUEDA SIMPLIFICADA (EVITA COLAPSO DE MICROSOFT)
+# 2. BÚSQUEDA Y FILTRADO INTELIGENTE
 # ---------------------------------------------------------
 def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     headers = {'Authorization': f'Bearer {access_token}'}
@@ -67,7 +107,6 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     start_iso = fecha_inicio.strftime('%Y-%m-%dT00:00:00Z')
     end_iso = (fecha_fin + datetime.timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
 
-    # Consulta súper simple a Microsoft (Solo fechas, sin filtros complejos ni ordenamiento)
     endpoint = (
         "https://graph.microsoft.com/v1.0/me/messages"
         f"?$filter=receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
@@ -79,12 +118,9 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
     files_in_memory = {}
     logs = []
     
-    logs.append(f"Consultando fechas desde {start_iso} hasta {end_iso}...")
-    
     url = endpoint
     messages = []
     
-    # Extraer correos (hasta 500)
     while url and len(messages) < 500:
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
@@ -92,25 +128,31 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
             messages.extend(data.get('value', []))
             url = data.get('@odata.nextLink')
         else:
-            logs.append(f"Error de Microsoft Graph: {res.status_code} - {res.text}")
             break
 
-    logs.append(f"Se descargó la lista de {len(messages)} correos. Filtrando adjuntos en Python...")
-
     for msg in messages:
-        # Filtrado de Python (Más eficiente y sin errores)
         if not msg.get('hasAttachments'):
             continue
 
         subject_raw = msg.get('subject') or "Sin Asunto"
-        msg_id = msg['id']
-        sender_info = msg.get('from', {}).get('emailAddress', {}) if msg.get('from') else {}
-        sender = f"{sender_info.get('name', '')} <{sender_info.get('address', '')}>"
+        subject_clean = limpiar_texto(subject_raw)
         
+        sender_info = msg.get('from', {}).get('emailAddress', {}) if msg.get('from') else {}
+        sender_name = limpiar_texto(sender_info.get('name', ''))
+        sender_email = limpiar_texto(sender_info.get('address', ''))
+        sender_full = f"{sender_name} {sender_email}"
+
+        # 1. FILTRAR EXCLUSIONES (Si el asunto o emisor contiene palabras prohibidas, se descarta)
+        if any(excl in subject_clean or excl in sender_full for excl in PALABRAS_EXCLUIDAS):
+            logs.append(f"❌ Descartado por filtro: '{subject_raw}' (Emisor: {sender_email})")
+            continue
+
+        # 2. FILTRAR PERMISOS (Debe contener alguna palabra clave de factura)
+        es_factura_valida = any(p in subject_clean for p in PALABRAS_CLAVE_PERMITIDAS)
+
+        msg_id = msg['id']
         raw_date = msg.get('receivedDateTime')
         msg_date = datetime.datetime.fromisoformat(raw_date.replace('Z', '+00:00')) if raw_date else datetime.datetime.now()
-        
-        logs.append(f"📥 Revisando: '{subject_raw}' (De: {sender})")
 
         attach_endpoint = f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}/attachments"
         attach_res = requests.get(attach_endpoint, headers=headers)
@@ -127,44 +169,59 @@ def download_invoices_in_memory(access_token, fecha_inicio, fecha_fin):
                 es_pdf = name_clean.endswith('.pdf')
                 es_xml = name_clean.endswith('.xml')
                 
-                if es_pdf or es_xml:
-                    if 'contentBytes' in att:
-                        import base64
-                        file_bytes = base64.b64decode(att['contentBytes'])
-                        safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name_raw}"
+                # Verificar si el nombre del archivo también indica factura
+                if any(p in name_clean for p in PALABRAS_CLAVE_PERMITIDAS):
+                    es_factura_valida = True
 
-                        if es_pdf:
-                            pdf_filename = safe_filename
-                            files_in_memory[safe_filename] = file_bytes
-                            logs.append(f"   ✅ PDF guardado: {name_raw}")
-                        elif es_xml and not xml_data:
-                            try:
-                                root = ET.fromstring(file_bytes)
-                                def find_t(tag):
-                                    for el in root.iter():
-                                        if el.tag.endswith(tag): return el.text
-                                    return "0"
-                                emisor = find_t("Nombre") or "Proveedor"
-                                total = float(find_t("TotalComprobante") or 0)
-                                subtotal = float(find_t("TotalVentaNeto") or total)
-                                xml_data = {"Prov": emisor, "Sub": subtotal, "Tot": total}
-                                logs.append(f"   ✅ XML procesado. Total: ₡{total}")
-                            except:
-                                xml_data = {"Prov": sender, "Sub": 0.0, "Tot": 0.0}
-                                logs.append(f"   ⚠️ XML leído pero sin formato estándar de factura.")
+                if (es_pdf or es_xml) and 'contentBytes' in att:
+                    import base64
+                    file_bytes = base64.b64decode(att['contentBytes'])
+                    safe_filename = f"{msg_date.strftime('%Y%m%d')}_{name_raw}"
+
+                    if es_pdf:
+                        pdf_filename = safe_filename
+                        files_in_memory[safe_filename] = file_bytes
+                    elif es_xml and not xml_data:
+                        try:
+                            xml_data = parse_xml_invoice(file_bytes)
+                        except:
+                            pass
+
+            # Solo agregar si pasó el filtro de factura válida y tiene monto mayor a 0 o proveedor detectado
+            if pdf_filename and es_factura_valida:
+                total_monto = xml_data["Total"] if xml_data else 0.0
+                
+                # Descartar si el total es 0 (evita falsos positivos sin monto)
+                if total_monto > 0:
+                    records.append({
+                        "Fecha": msg_date.strftime('%Y-%m-%d'),
+                        "Trimestre": get_quarter(msg_date.month),
+                        "Proveedor": xml_data["Proveedor"] if xml_data else sender_info.get('name', 'Proveedor'),
+                        "Subtotal": xml_data["Subtotal"] if xml_data else 0.0,
+                        "IVA": xml_data["IVA"] if xml_data else 0.0,
+                        "Total": total_monto,
+                        "Asunto": subject_raw,
+                        "Archivo": pdf_filename
+                    })
+                    logs.append(f"✅ Factura aceptada: '{subject_raw}' - Monto: ₡{total_monto}")
                 else:
-                    logs.append(f"   ⏭️ Ignorado: {name_raw} (No es PDF/XML)")
-
-            if pdf_filename:
-                records.append({
-                    "Fecha": msg_date.strftime('%Y-%m-%d'),
-                    "Proveedor": xml_data["Prov"] if xml_data else sender,
-                    "Total": xml_data["Tot"] if xml_data else 0.0,
-                    "Asunto": subject_raw,
-                    "Archivo": pdf_filename
-                })
+                    logs.append(f"⚠️ Descartado (Total en 0): '{subject_raw}'")
 
     return records, files_in_memory, logs
+
+def merge_pdfs_from_memory(files_dict, filenames):
+    if not HAS_PYPDF: return None
+    merger = PdfWriter()
+    for name in filenames:
+        if name in files_dict:
+            try:
+                merger.append(io.BytesIO(files_dict[name]))
+            except Exception:
+                pass
+    output_pdf = io.BytesIO()
+    merger.write(output_pdf)
+    merger.close()
+    return output_pdf.getvalue()
 
 # ---------------------------------------------------------
 # 3. INTERFAZ STREAMLIT
@@ -179,7 +236,7 @@ if access_token:
     fecha_fin = st.sidebar.date_input("Fecha Fin", datetime.date(2026, 9, 28))
 
     if st.sidebar.button("🔄 Buscar y Descargar Facturas", use_container_width=True):
-        with st.spinner("Buscando facturas (Puede tardar de 10 a 30 segundos)..."):
+        with st.spinner("Filtrando facturas válidas..."):
             records, files_dict, logs = download_invoices_in_memory(access_token, fecha_inicio, fecha_fin)
             df_invoices = pd.DataFrame(records)
             
@@ -188,12 +245,12 @@ if access_token:
             st.session_state['logs'] = logs
             
             if not df_invoices.empty:
-                st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas.")
+                st.success(f"¡Listo! Se procesaron {len(df_invoices)} facturas válidas.")
             else:
-                st.error("Búsqueda completada, pero no se encontraron PDFs ni XMLs en las fechas.")
+                st.warning("No se encontraron facturas con los nuevos filtros.")
 
 if 'logs' in st.session_state and st.session_state['logs']:
-    with st.expander("🛠️ MODO DIAGNÓSTICO: Haz clic aquí para ver qué ocurrió"):
+    with st.expander("🛠️ Ver registro de filtros (Diagnóstico)"):
         for linea in st.session_state['logs']:
             st.text(linea)
 
@@ -202,28 +259,31 @@ if 'df_invoices_graph' in st.session_state and not st.session_state['df_invoices
     files_dict = st.session_state['files_in_memory']
 
     st.divider()
-    col_m1, col_m2 = st.columns(2)
-    col_m1.metric("Facturas Procesadas", len(df))
-    col_m2.metric("Total Acumulado", f"₡{df['Total'].sum():,.2f}")
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Facturas Válidas", len(df))
+    col_m2.metric("Subtotal Acumulado", f"₡{df['Subtotal'].sum():,.2f}")
+    col_m3.metric("Total Acumulado", f"₡{df['Total'].sum():,.2f}")
 
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df[['Fecha', 'Proveedor', 'Subtotal', 'IVA', 'Total', 'Asunto']], use_container_width=True)
 
     st.subheader("⚡ Descargas")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         if HAS_PYPDF:
-            merger = PdfWriter()
-            for name in df['Archivo'].tolist():
-                if name in files_dict: merger.append(io.BytesIO(files_dict[name]))
-            output_pdf = io.BytesIO()
-            merger.write(output_pdf)
-            merger.close()
-            st.download_button("📄 Descargar PDF Consolidado", data=output_pdf.getvalue(), file_name="Consolidado.pdf", mime="application/pdf", use_container_width=True)
+            merged_pdf_bytes = merge_pdfs_from_memory(files_dict, df['Archivo'].tolist())
+            if merged_pdf_bytes:
+                st.download_button("📄 Descargar PDF Consolidado", data=merged_pdf_bytes, file_name="Facturas_Consolidadas.pdf", mime="application/pdf", use_container_width=True)
 
     with col2:
+        output_excel = io.BytesIO()
+        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Detalle')
+        st.download_button("📊 Descargar Excel Resumen", data=output_excel.getvalue(), file_name="Reporte_Facturas.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+    with col3:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for fname, fbytes in files_dict.items():
                 zip_file.writestr(fname, fbytes)
-        st.download_button("📦 Descargar Paquete ZIP (Todos los PDFs)", data=zip_buffer.getvalue(), file_name="Archivos.zip", mime="application/zip", use_container_width=True)
+        st.download_button("📦 Descargar Paquete ZIP", data=zip_buffer.getvalue(), file_name="Facturas_Zip.zip", mime="application/zip", use_container_width=True)
